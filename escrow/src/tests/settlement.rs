@@ -21,7 +21,10 @@ use super::{
     assert_contract_error, default_init, deploy, deploy_with_id, free_addresses,
     install_stellar_asset_token, setup, StellarTestToken, MAX_DUST_SWEEP_AMOUNT, TARGET,
 };
-use crate::{EscrowError, EscrowSettled, LiquifactEscrow, SettlementReadiness, YieldTier};
+use crate::{
+    is_maturity_reached, EscrowError, EscrowSettled, LiquifactEscrow, SettlementReadiness,
+    YieldTier,
+};
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger as _},
     token::StellarAssetClient,
@@ -2214,4 +2217,103 @@ fn test_settlement_readiness_maturity_gate_parity() {
     assert!(at.ready_now);
     let settled = client.settle();
     assert_eq!(settled.status, 2);
+}
+
+// --- is_maturity_reached helper: boundary semantics preserved by refactor ---
+//
+// These tests pin down the inclusive `>=` boundary at the helper level so the
+// extract-refactor cannot regress the off-by-one behaviour exercised elsewhere
+// (`test_settle_fails_one_second_before_maturity`, `test_settle_passes_exactly_at_maturity_ledger_time`,
+// the `is_settleable` family, and `test_settlement_readiness_maturity_gate_parity`).
+//
+// The helper is the single source of truth for both the pre-maturity gate in
+// `settleable_now` (the inverted check) and the public `maturity_reached`
+// flag returned by `get_settlement_readiness`. Boundary drift in this function
+// would silently flip the entire settlement gate for both the entrypoint and
+// the read view, so we lock every relevant boundary independently.
+
+/// `maturity == 0` is the documented "no maturity lock" configuration and must
+/// be reported as vacuously reached regardless of the current ledger time.
+#[test]
+fn test_is_maturity_reached_maturity_zero_is_vacuously_reached() {
+    let env = Env::default();
+
+    // Below any positive maturity: still vacuously reached.
+    env.ledger().with_mut(|l| l.timestamp = 0);
+    assert!(is_maturity_reached(&env, 0));
+
+    env.ledger().with_mut(|l| l.timestamp = 1_234_567);
+    assert!(
+        is_maturity_reached(&env, 0),
+        "maturity == 0 must be vacuously reached at any ledger time"
+    );
+}
+
+/// One second before a configured maturity must report `not reached`,
+/// confirming the helper's strict `<` below boundary.
+#[test]
+fn test_is_maturity_reached_just_before_returns_false() {
+    let env = Env::default();
+    let maturity: u64 = 20_000;
+
+    env.ledger().with_mut(|l| l.timestamp = maturity - 1);
+    assert!(
+        !is_maturity_reached(&env, maturity),
+        "ledger.timestamp == maturity - 1 must NOT report maturity reached"
+    );
+}
+
+/// Exactly at the configured maturity must report `reached`, confirming the
+/// helper's inclusive `>=` boundary (the same boundary `settle` enforces).
+#[test]
+fn test_is_maturity_reached_exactly_at_returns_true() {
+    let env = Env::default();
+    let maturity: u64 = 20_000;
+
+    env.ledger().with_mut(|l| l.timestamp = maturity);
+    assert!(
+        is_maturity_reached(&env, maturity),
+        "ledger.timestamp == maturity must report maturity reached (inclusive boundary)"
+    );
+}
+
+/// One second after a configured maturity must report `reached` and must
+/// remain reached at any larger timestamp (inclusive boundary above).
+#[test]
+fn test_is_maturity_reached_just_after_and_far_after_return_true() {
+    let env = Env::default();
+    let maturity: u64 = 20_000;
+
+    env.ledger().with_mut(|l| l.timestamp = maturity + 1);
+    assert!(
+        is_maturity_reached(&env, maturity),
+        "ledger.timestamp == maturity + 1 must report maturity reached"
+    );
+
+    env.ledger()
+        .with_mut(|l| l.timestamp = maturity + 1_000_000);
+    assert!(
+        is_maturity_reached(&env, maturity),
+        "any ledger.timestamp > maturity must continue to report maturity reached"
+    );
+}
+
+/// Far before a configured maturity must report `not reached` and must remain
+/// not reached at any smaller timestamp (strict `<` below boundary above).
+#[test]
+fn test_is_maturity_reached_far_before_returns_false() {
+    let env = Env::default();
+    let maturity: u64 = 1_000_000;
+
+    env.ledger().with_mut(|l| l.timestamp = 0);
+    assert!(
+        !is_maturity_reached(&env, maturity),
+        "ledger.timestamp == 0 must NOT report maturity reached when maturity > 0"
+    );
+
+    env.ledger().with_mut(|l| l.timestamp = maturity - 1);
+    assert!(
+        !is_maturity_reached(&env, maturity),
+        "any ledger.timestamp < maturity must NOT report maturity reached"
+    );
 }
